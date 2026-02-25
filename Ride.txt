@@ -1,0 +1,756 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, onAuthStateChanged, signInAnonymously, signInWithCustomToken } from 'firebase/auth';
+import { getFirestore, collection, addDoc, onSnapshot, query, doc, setDoc, updateDoc, deleteDoc, runTransaction } from 'firebase/firestore';
+import { 
+  MapPin, 
+  Navigation, 
+  Clock, 
+  User, 
+  Star, 
+  ChevronRight, 
+  Menu, 
+  X, 
+  Shield, 
+  ArrowLeft,
+  Car,
+  Zap,
+  Users,
+  CheckCircle2,
+  Phone,
+  MessageSquare,
+  MoreVertical,
+  Navigation2,
+  Compass,
+  CreditCard as CardIcon,
+  Search,
+  History,
+  Activity,
+  Bell,
+  Wallet,
+  Camera,
+  LogOut,
+  Mail,
+  Send,
+  ThumbsUp,
+  TrendingUp,
+  DollarSign
+} from 'lucide-react';
+
+// --- Firebase Configuration & Initialization ---
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+// --- Theme & Style Config ---
+const THEME = {
+  primary: '#6366f1',
+  secondary: '#1e293b',
+  accent: '#a5b4fc',
+  glass: 'backdrop-blur-2xl bg-white/80 border border-white/40 shadow-[0_8px_32px_0_rgba(31,38,135,0.07)]',
+  darkGlass: 'backdrop-blur-2xl bg-slate-950/90 border border-slate-800/50 shadow-2xl'
+};
+
+const RIDE_TYPES = [
+  { id: 'prime', name: 'RIDES Prime', price: 1.0, time: 3, icon: <Car />, desc: 'Elite comfort, standard price' },
+  { id: 'luxe', name: 'RIDES Luxe', price: 2.2, time: 2, icon: <Zap className="text-amber-400" />, desc: 'Premium executive travel' },
+  { id: 'saver', name: 'RIDES Saver', price: 0.7, time: 7, icon: <Users />, desc: 'Economical shared transit' },
+];
+
+const MOCK_LOCATIONS = [
+  { name: 'Times Square', coords: [40.7580, -73.9855], address: 'Manhattan, NY 10036' },
+  { name: 'Central Park', coords: [40.7829, -73.9654], address: 'New York, NY' },
+  { name: 'Empire State Building', coords: [40.7484, -73.9857], address: '350 5th Ave, NY' },
+  { name: 'Brooklyn Bridge', coords: [40.7061, -73.9969], address: 'Brooklyn, NY' },
+  { name: 'Statue of Liberty', coords: [40.6892, -74.0445], address: 'Liberty Island, NY' },
+  { name: 'JFK Airport', coords: [40.6413, -73.7781], address: 'Queens, NY' },
+];
+
+const NYC_CENTER = [40.7128, -74.0060];
+
+const APP_STATES = {
+  SPLASH: 'splash',
+  AUTH: 'auth',
+  HOME: 'home',
+  SELECTING: 'selecting',
+  SEARCHING: 'searching',
+  MATCHED: 'matched',
+  ON_TRIP: 'on_trip',
+  RATING: 'rating',
+  COMPLETED: 'completed',
+  HISTORY: 'history',
+  PROFILE: 'profile'
+};
+
+// --- Main App Component ---
+export default function App() {
+  const [appState, setAppState] = useState(APP_STATES.SPLASH);
+  const [role, setRole] = useState('rider'); 
+  const [user, setUser] = useState(null);
+  const [profile, setProfile] = useState(null);
+  
+  // Trip & Marketplace State
+  const [pickup, setPickup] = useState('Current Location');
+  const [destination, setDestination] = useState('');
+  const [destCoords, setDestCoords] = useState(null);
+  const [suggestions, setSuggestions] = useState([]);
+  const [selectedRide, setSelectedRide] = useState(RIDE_TYPES[0]);
+  const [progress, setProgress] = useState(0);
+  const [matchedDriver, setMatchedDriver] = useState(null);
+  const [matchedRider, setMatchedRider] = useState(null);
+  const [activeRequestDocId, setActiveRequestDocId] = useState(null);
+  const [marketplaceRequests, setMarketplaceRequests] = useState([]);
+  const [tripHistory, setTripHistory] = useState([]);
+  
+  // UI States
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const [isChatOpen, setIsChatOpen] = useState(false);
+  const [messages, setMessages] = useState([]);
+  const [chatInput, setChatInput] = useState('');
+  const [tempRating, setTempRating] = useState(0);
+  const [authName, setAuthName] = useState('');
+  const [leafletLoaded, setLeafletLoaded] = useState(false);
+
+  // Refs
+  const mapRef = useRef(null);
+  const mapInstance = useRef(null);
+  const markersRef = useRef({ user: null, driver: null, route: null });
+  const chatEndRef = useRef(null);
+
+  // --- Initialize Auth & External Maps ---
+  useEffect(() => {
+    // Auth Init (Rule 3)
+    const initAuth = async () => {
+      if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+        await signInWithCustomToken(auth, __initial_auth_token);
+      } else {
+        await signInAnonymously(auth);
+      }
+    };
+    initAuth();
+    const unsubAuth = onAuthStateChanged(auth, setUser);
+
+    // Leaflet Loader
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+    document.head.appendChild(link);
+    const script = document.createElement('script');
+    script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+    script.async = true;
+    script.onload = () => setLeafletLoaded(true);
+    document.head.appendChild(script);
+
+    return () => {
+      unsubAuth();
+      document.head.removeChild(link);
+      document.head.removeChild(script);
+    };
+  }, []);
+
+  // --- Real-time Listeners (Rules 1 & 2) ---
+  useEffect(() => {
+    if (!user) return;
+
+    // Profile Watcher
+    const profileDocRef = doc(db, 'artifacts', appId, 'users', user.uid, 'profile', 'main');
+    const unsubProfile = onSnapshot(profileDocRef, (snap) => {
+      if (snap.exists()) {
+        setProfile(snap.data());
+        if (appState === APP_STATES.AUTH || appState === APP_STATES.SPLASH) setAppState(APP_STATES.HOME);
+      } else {
+        setAppState(APP_STATES.AUTH);
+      }
+    });
+
+    // Marketplace Watcher (For Pilots)
+    const marketplaceRef = collection(db, 'artifacts', appId, 'public', 'data', 'active_requests');
+    const unsubMarket = onSnapshot(marketplaceRef, (snap) => {
+      const requests = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      setMarketplaceRequests(requests.filter(r => r.status === 'pending'));
+    });
+
+    // History Watcher
+    const historyRef = collection(db, 'artifacts', appId, 'users', user.uid, 'trips');
+    const unsubHistory = onSnapshot(historyRef, (snap) => {
+      const trips = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      setTripHistory(trips.sort((a, b) => b.timestamp - a.timestamp));
+    });
+
+    return () => {
+      unsubProfile();
+      unsubMarket();
+      unsubHistory();
+    };
+  }, [user]);
+
+  // Active Request & Chat Sync
+  useEffect(() => {
+    if (!activeRequestDocId || !user) {
+      setMessages([]);
+      return;
+    }
+
+    const requestDoc = doc(db, 'artifacts', appId, 'public', 'data', 'active_requests', activeRequestDocId);
+    const unsubRequest = onSnapshot(requestDoc, (snap) => {
+      if (snap.exists()) {
+        const data = snap.data();
+        if (data.status === 'matched') {
+          if (role === 'rider') {
+            setMatchedDriver({
+              id: data.driverId,
+              name: data.driverName,
+              image: data.driverImage || `https://api.dicebear.com/7.x/avataaars/svg?seed=${data.driverId}`,
+              car: "Tesla Model S • RIDES-01"
+            });
+          } else {
+            setMatchedRider(data);
+          }
+          if (appState === APP_STATES.SEARCHING) setAppState(APP_STATES.MATCHED);
+        }
+      } else if (appState === APP_STATES.MATCHED || appState === APP_STATES.SEARCHING) {
+        if (appState !== APP_STATES.ON_TRIP && appState !== APP_STATES.RATING && appState !== APP_STATES.COMPLETED) {
+            resetApp();
+        }
+      }
+    });
+
+    const msgRef = collection(db, 'artifacts', appId, 'public', 'data', 'active_requests', activeRequestDocId, 'messages');
+    const unsubMsgs = onSnapshot(msgRef, (snap) => {
+      const msgs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      setMessages(msgs.sort((a, b) => a.timestamp - b.timestamp));
+    });
+
+    return () => {
+      unsubRequest();
+      unsubMsgs();
+    };
+  }, [activeRequestDocId, user, appState]);
+
+  // --- Map and Trip Animation Logic ---
+  useEffect(() => {
+    if (leafletLoaded && mapRef.current && !mapInstance.current) {
+      const L = window.L;
+      const map = L.map(mapRef.current, { zoomControl: false, attributionControl: false }).setView(NYC_CENTER, 14);
+      L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', { maxZoom: 20 }).addTo(map);
+      mapInstance.current = map;
+      
+      const userIcon = L.divIcon({
+        className: 'custom-div-icon',
+        html: `<div class="w-6 h-6 bg-white rounded-full border-4 border-indigo-600 shadow-xl flex items-center justify-center"><div class="w-2 h-2 bg-indigo-600 rounded-full animate-ping"></div></div>`,
+        iconSize: [24, 24],
+        iconAnchor: [12, 12]
+      });
+      markersRef.current.user = L.marker(NYC_CENTER, { icon: userIcon }).addTo(map);
+    }
+  }, [leafletLoaded]);
+
+  useEffect(() => {
+    if (appState === APP_STATES.MATCHED && destCoords && mapInstance.current && window.L) {
+      const L = window.L;
+      if (markersRef.current.route) markersRef.current.route.remove();
+      markersRef.current.route = L.polyline([NYC_CENTER, destCoords], {
+        color: THEME.primary,
+        weight: 5,
+        opacity: 0.8,
+        dashArray: '10, 10'
+      }).addTo(mapInstance.current);
+      mapInstance.current.fitBounds(markersRef.current.route.getBounds(), { padding: [100, 100], animate: true });
+    }
+  }, [appState, destCoords]);
+
+  useEffect(() => {
+    if (appState === APP_STATES.ON_TRIP) {
+      const interval = setInterval(() => {
+        setProgress(p => {
+          if (p >= 100) {
+            clearInterval(interval);
+            setAppState(APP_STATES.RATING);
+            return 100;
+          }
+          return p + 2.5;
+        });
+      }, 150);
+      return () => clearInterval(interval);
+    }
+  }, [appState]);
+
+  // --- Handlers ---
+
+  const handleCreateProfile = async () => {
+    if (!user || !authName) return;
+    const profileRef = doc(db, 'artifacts', appId, 'users', user.uid, 'profile', 'main');
+    await setDoc(profileRef, {
+      name: authName,
+      balance: 500.00,
+      rating: 5.0,
+      ratingSum: 5.0,
+      totalRatings: 1,
+      trips: 0,
+      earnings: 0,
+      avatar: `https://api.dicebear.com/7.x/avataaars/svg?seed=${authName}`,
+      createdAt: Date.now()
+    });
+  };
+
+  const handleSearch = (val) => {
+    setDestination(val);
+    setDestCoords(null);
+    if (val.length > 1) {
+      const matches = MOCK_LOCATIONS.filter(l => l.name.toLowerCase().includes(val.toLowerCase()));
+      setSuggestions(matches);
+    } else {
+      setSuggestions([]);
+    }
+  };
+
+  const submitBooking = async () => {
+    if (!user || !profile || !destCoords) return;
+    setAppState(APP_STATES.SEARCHING);
+    try {
+      const reqRef = collection(db, 'artifacts', appId, 'public', 'data', 'active_requests');
+      const docRef = await addDoc(reqRef, {
+        riderId: user.uid,
+        riderName: profile.name,
+        riderImage: profile.avatar,
+        pickup,
+        destination,
+        destCoords,
+        rideType: selectedRide.name,
+        fare: (selectedRide.price * 24.50).toFixed(2),
+        status: 'pending',
+        timestamp: Date.now()
+      });
+      setActiveRequestDocId(docRef.id);
+    } catch (e) { console.error(e); }
+  };
+
+  const acceptRequest = async (req) => {
+    if (!user || !profile) return;
+    try {
+      const reqDoc = doc(db, 'artifacts', appId, 'public', 'data', 'active_requests', req.id);
+      await updateDoc(reqDoc, {
+        status: 'matched',
+        driverId: user.uid,
+        driverName: profile.name,
+        driverImage: profile.avatar
+      });
+      setActiveRequestDocId(req.id);
+      setMatchedRider(req);
+      setDestCoords(req.destCoords);
+      setAppState(APP_STATES.MATCHED);
+      
+      const msgRef = collection(db, 'artifacts', appId, 'public', 'data', 'active_requests', req.id, 'messages');
+      await addDoc(msgRef, { senderId: 'system', text: `Pilot ${profile.name} is on the way.`, timestamp: Date.now() });
+    } catch (e) { console.error(e); }
+  };
+
+  const sendMessage = async () => {
+    if (!chatInput.trim() || !user || !activeRequestDocId) return;
+    const msgRef = collection(db, 'artifacts', appId, 'public', 'data', 'active_requests', activeRequestDocId, 'messages');
+    await addDoc(msgRef, {
+      senderId: user.uid,
+      senderName: profile.name,
+      text: chatInput,
+      timestamp: Date.now()
+    });
+    setChatInput('');
+  };
+
+  const finalizeTrip = async () => {
+    if (!user || !profile) return;
+    const fareVal = parseFloat((selectedRide.price * 24.50).toFixed(2));
+    const myProfileRef = doc(db, 'artifacts', appId, 'users', user.uid, 'profile', 'main');
+    
+    if (role === 'rider') {
+      await updateDoc(myProfileRef, {
+        balance: profile.balance - fareVal,
+        trips: (profile.trips || 0) + 1
+      });
+      
+      if (matchedDriver?.id) {
+        const targetRef = doc(db, 'artifacts', appId, 'users', matchedDriver.id, 'profile', 'main');
+        await runTransaction(db, async (tx) => {
+          const snap = await tx.get(targetRef);
+          if (snap.exists()) {
+            const d = snap.data();
+            const sum = (d.ratingSum || 0) + tempRating;
+            const count = (d.totalRatings || 0) + 1;
+            tx.update(targetRef, {
+              ratingSum: sum,
+              totalRatings: count,
+              rating: parseFloat((sum / count).toFixed(1)),
+              earnings: (d.earnings || 0) + (fareVal * 0.8)
+            });
+          }
+        });
+      }
+
+      const historyRef = collection(db, 'artifacts', appId, 'users', user.uid, 'trips');
+      await addDoc(historyRef, {
+        pickup, destination, fare: fareVal.toFixed(2), timestamp: Date.now(),
+        driverName: matchedDriver?.name || "System", rating: tempRating
+      });
+    } else {
+      await updateDoc(myProfileRef, {
+        balance: (profile.balance || 0) + (fareVal * 0.8),
+        trips: (profile.trips || 0) + 1
+      });
+    }
+
+    if (activeRequestDocId) {
+      await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'active_requests', activeRequestDocId));
+    }
+    setAppState(APP_STATES.COMPLETED);
+  };
+
+  const resetApp = () => {
+    setAppState(APP_STATES.HOME);
+    setPickup('Current Location');
+    setDestination('');
+    setDestCoords(null);
+    setProgress(0);
+    setMatchedDriver(null);
+    setMatchedRider(null);
+    setActiveRequestDocId(null);
+    setIsChatOpen(false);
+    setTempRating(0);
+    if (markersRef.current.route) markersRef.current.route.remove();
+    if (mapInstance.current) mapInstance.current.setView(NYC_CENTER, 14);
+  };
+
+  // --- Render Helpers ---
+
+  if (appState === APP_STATES.SPLASH) {
+    return (
+      <div className="h-screen w-full bg-slate-950 flex items-center justify-center max-w-md mx-auto relative overflow-hidden">
+        <div className="z-10 text-center animate-in fade-in zoom-in-95 duration-1000">
+          <div className="w-24 h-24 bg-white rounded-[40px] flex items-center justify-center mx-auto mb-8 shadow-2xl rotate-12">
+            <Navigation className="w-12 h-12 text-slate-950 fill-slate-950" />
+          </div>
+          <h1 className="text-6xl font-black italic tracking-tighter text-white">RIDES</h1>
+          <p className="text-indigo-400 font-bold tracking-[0.3em] mt-4 uppercase text-[10px]">Cloud Logistics V4</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (appState === APP_STATES.AUTH) {
+    return (
+      <div className="h-screen w-full bg-slate-950 flex flex-col justify-end max-w-md mx-auto">
+        <div className="p-10 space-y-8 bg-white rounded-t-[50px] animate-in slide-in-from-bottom-20 duration-700">
+          <header>
+            <h1 className="text-5xl font-black tracking-tighter text-slate-900 leading-[0.85]">Join<br/><span className="text-indigo-600">RIDES</span></h1>
+            <p className="text-slate-400 font-bold mt-6 text-[10px] uppercase tracking-widest">Premium Mobility Network</p>
+          </header>
+          <div className="flex items-center gap-4 p-5 bg-slate-50 rounded-3xl border border-slate-100 focus-within:ring-4 ring-indigo-500/10">
+            <User className="w-5 h-5 text-slate-300" />
+            <input 
+              type="text" placeholder="Your Full Name" 
+              className="bg-transparent w-full outline-none font-black text-slate-900" 
+              value={authName} onChange={(e) => setAuthName(e.target.value)} 
+            />
+          </div>
+          <button 
+            onClick={handleCreateProfile} disabled={!authName}
+            className="w-full bg-slate-900 text-white py-6 rounded-[35px] font-black text-xl shadow-2xl disabled:opacity-30"
+          >
+            Create Profile
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="relative h-screen w-full flex flex-col font-sans bg-slate-950 overflow-hidden max-w-md mx-auto shadow-2xl">
+      
+      {/* Header HUD */}
+      <div className="absolute top-0 left-0 right-0 z-[60] p-6 flex justify-between items-center">
+        <button 
+          onClick={() => isMenuOpen ? setIsMenuOpen(false) : (appState === APP_STATES.HOME ? setIsMenuOpen(true) : resetApp())}
+          className={`p-4 rounded-3xl shadow-2xl pointer-events-auto active:scale-90 transition-all ${THEME.darkGlass}`}
+        >
+          { (appState === APP_STATES.HOME) ? <Menu className="w-6 h-6 text-white" /> : <ArrowLeft className="w-6 h-6 text-white" />}
+        </button>
+
+        <div className={`px-6 py-3 rounded-3xl shadow-2xl pointer-events-auto flex items-center gap-3 ${THEME.darkGlass}`}>
+          <div className={`w-2 h-2 ${role === 'driver' ? 'bg-amber-500 shadow-[0_0_8px_#f59e0b]' : 'bg-emerald-500 shadow-[0_0_8px_#10b981]'} rounded-full animate-pulse`} />
+          <span className="text-xl font-black tracking-tighter italic text-white uppercase">{role === 'driver' ? 'Pilot' : 'Rides'}</span>
+        </div>
+      </div>
+
+      {/* Map Content */}
+      <div ref={mapRef} className={`absolute inset-0 transition-opacity duration-1000 ${appState === APP_STATES.HISTORY || appState === APP_STATES.PROFILE || appState === APP_STATES.RATING ? 'opacity-0' : 'opacity-100'}`} style={{ zIndex: 10 }} />
+
+      {/* Main UI Overlay */}
+      <div className="absolute inset-0 pointer-events-none flex flex-col justify-end z-[20]">
+        <div className={`rounded-t-[50px] shadow-2xl p-8 pointer-events-auto transition-all duration-700
+          ${appState === APP_STATES.HISTORY || appState === APP_STATES.PROFILE || appState === APP_STATES.RATING || (role === 'driver' && appState === APP_STATES.HOME) ? 'h-full bg-slate-50' : 'max-h-[85%] bg-white'}`}>
+          
+          <div className="w-16 h-1.5 bg-slate-200 rounded-full mx-auto mb-10 opacity-50" />
+
+          {/* RIDER HOME */}
+          {role === 'rider' && appState === APP_STATES.HOME && (
+            <div className="space-y-8 animate-in slide-in-from-bottom-10">
+              <header className="flex justify-between items-start">
+                <h1 className="text-5xl font-black tracking-tighter text-slate-900 leading-[0.85]">Where<br/><span className="text-indigo-600">to next?</span></h1>
+                <div onClick={() => setAppState(APP_STATES.PROFILE)} className="p-1 bg-slate-100 rounded-2xl cursor-pointer">
+                  <img src={profile?.avatar} className="w-12 h-12 rounded-xl" alt="P" />
+                </div>
+              </header>
+              <div className="space-y-3 relative">
+                <div className="flex items-center gap-4 p-5 bg-slate-50 rounded-3xl border border-slate-100 focus-within:bg-white">
+                  <div className="w-3 h-3 bg-indigo-500 rounded-full" />
+                  <input type="text" placeholder="Pickup" className="bg-transparent w-full outline-none font-black" value={pickup} onChange={(e) => setPickup(e.target.value)} />
+                </div>
+                <div className="flex items-center gap-4 p-5 bg-slate-50 rounded-3xl border border-slate-100 focus-within:bg-white">
+                  <div className="w-3 h-3 bg-slate-900 rounded-sm" />
+                  <input type="text" placeholder="Destination" className="bg-transparent w-full outline-none font-black" value={destination} onChange={(e) => handleSearch(e.target.value)} />
+                  <Search className="w-5 h-5 text-slate-300" />
+                </div>
+                
+                {suggestions.length > 0 && (
+                  <div className="absolute top-[135px] left-0 right-0 bg-white rounded-3xl shadow-2xl border p-2 z-[100] animate-in slide-in-from-top-2">
+                    {suggestions.map((loc, i) => (
+                      <button key={i} onClick={() => { setDestination(loc.name); setDestCoords(loc.coords); setSuggestions([]); }} className="w-full flex items-center gap-4 p-4 hover:bg-slate-50 rounded-2xl text-left border-b last:border-0">
+                        <MapPin className="w-4 h-4 text-indigo-600" />
+                        <div><p className="font-black text-sm">{loc.name}</p><p className="text-[10px] text-slate-400 font-bold uppercase">{loc.address}</p></div>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <button 
+                  onClick={() => destCoords && setAppState(APP_STATES.SELECTING)} disabled={!destCoords}
+                  className="flex flex-col gap-4 p-6 bg-slate-900 text-white rounded-[40px] shadow-xl disabled:opacity-20"
+                >
+                   <Navigation2 className="w-6 h-6 text-indigo-400" />
+                   <span className="font-black text-[10px] uppercase tracking-widest">Book Ride</span>
+                </button>
+                <div className="bg-white border border-slate-100 rounded-[40px] p-6">
+                   <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Balance</p>
+                   <p className="text-xl font-black italic text-slate-900">${profile?.balance?.toFixed(2)}</p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* PILOT HOME */}
+          {role === 'driver' && appState === APP_STATES.HOME && (
+            <div className="h-full space-y-6 animate-in fade-in">
+              <header className="flex justify-between items-end">
+                <h1 className="text-4xl font-black italic tracking-tighter uppercase text-slate-900 leading-none">Market<br/>place</h1>
+                <div className="bg-amber-600 text-white px-4 py-2 rounded-full font-black text-[10px] tracking-widest uppercase flex items-center gap-2">
+                  <Activity className="w-3 h-3" /> Pilot Active
+                </div>
+              </header>
+              <div className="bg-slate-900 p-8 rounded-[40px] text-white flex justify-between items-center group relative overflow-hidden">
+                 <TrendingUp className="absolute right-0 top-0 w-32 h-32 opacity-10 -rotate-12" />
+                 <div><p className="text-[10px] font-black opacity-60 uppercase mb-2">Earnings Today</p><p className="text-4xl font-black italic">${(profile?.earnings || 0).toFixed(2)}</p></div>
+                 <div className="text-right"><p className="text-[10px] font-black opacity-60 uppercase mb-2">Trips</p><p className="text-2xl font-black italic">{profile?.trips || 0}</p></div>
+              </div>
+              <div className="space-y-4 overflow-y-auto max-h-[55vh] pb-24 no-scrollbar">
+                {marketplaceRequests.length === 0 ? (
+                  <div className="text-center py-20 opacity-20"><Bell className="w-12 h-12 mx-auto mb-4 animate-bounce" /><p className="font-black uppercase text-[10px] tracking-widest">Listening for signals...</p></div>
+                ) : (
+                  marketplaceRequests.map(r => (
+                    <div key={r.id} className="bg-white p-8 rounded-[45px] border border-slate-100 shadow-xl space-y-6">
+                      <div className="flex justify-between items-start">
+                        <div className="flex items-center gap-4">
+                          <img src={r.riderImage} className="w-12 h-12 rounded-2xl bg-slate-50" alt="R" />
+                          <div><p className="text-[10px] font-black text-indigo-600 tracking-widest uppercase">{r.riderName}</p><h3 className="font-black text-xl italic">{r.rideType}</h3></div>
+                        </div>
+                        <p className="text-3xl font-black italic tracking-tighter">${r.fare}</p>
+                      </div>
+                      <button onClick={() => acceptRequest(r)} className="w-full bg-slate-900 text-white py-5 rounded-[30px] font-black text-lg active:scale-95">Accept Mission</button>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* SELECTION / MATCHED / TRIP / COMPLETED */}
+          {appState === APP_STATES.SELECTING && (
+            <div className="space-y-6">
+              <h2 className="text-2xl font-black italic text-slate-900 uppercase">Select Tier</h2>
+              <div className="space-y-3">
+                {RIDE_TYPES.map(r => (
+                  <div key={r.id} onClick={() => setSelectedRide(r)} className={`flex items-center justify-between p-6 rounded-[35px] border-2 transition-all ${selectedRide.id === r.id ? 'border-indigo-600 bg-indigo-50/50 scale-[1.02]' : 'border-transparent bg-white'}`}>
+                    <div className="flex items-center gap-5">
+                      <div className={`p-4 rounded-2xl ${selectedRide.id === r.id ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-400'}`}>{r.icon}</div>
+                      <div><p className="font-black text-lg">{r.name}</p><p className="text-[10px] text-slate-400 font-bold uppercase">{r.desc}</p></div>
+                    </div>
+                    <p className="font-black text-2xl italic">${(r.price * 24.50).toFixed(2)}</p>
+                  </div>
+                ))}
+              </div>
+              <button onClick={submitBooking} className="w-full bg-slate-900 text-white py-6 rounded-[35px] font-black text-xl">Confirm {selectedRide.name}</button>
+            </div>
+          )}
+
+          {appState === APP_STATES.MATCHED && (
+            <div className="space-y-8 animate-in slide-in-from-bottom-5">
+              <div className="flex justify-between items-center">
+                <h2 className="text-3xl font-black italic uppercase text-indigo-600">Matched</h2>
+                <button onClick={() => setIsChatOpen(true)} className="p-4 bg-slate-100 rounded-2xl relative">
+                  <MessageSquare className="w-6 h-6 text-indigo-600" />
+                  {messages.length > 0 && <div className="absolute top-3 right-3 w-3 h-3 bg-red-500 rounded-full border-2 border-white" />}
+                </button>
+              </div>
+              <div className="bg-slate-950 p-8 rounded-[45px] shadow-2xl flex items-center gap-6">
+                <img src={role === 'rider' ? matchedDriver?.image : matchedRider?.riderImage} className="w-20 h-20 rounded-3xl object-cover ring-4 ring-white/10" alt="D" />
+                <div className="flex-1">
+                  <p className="font-black text-2xl text-white">{role === 'rider' ? matchedDriver?.name : matchedRider?.riderName}</p>
+                  <p className="text-[11px] font-black text-indigo-400 tracking-widest uppercase tracking-widest">{role === 'rider' ? matchedDriver?.car : "Pilot at Location"}</p>
+                </div>
+              </div>
+              <button onClick={() => setAppState(APP_STATES.ON_TRIP)} className="w-full bg-emerald-600 text-white py-6 rounded-[35px] font-black text-xl hover:bg-emerald-700">
+                {role === 'driver' ? "Initiate Transit" : "Start Ride"}
+              </button>
+            </div>
+          )}
+
+          {appState === APP_STATES.ON_TRIP && (
+            <div className="space-y-10">
+              <h2 className="text-3xl font-black italic uppercase text-slate-900">In Transit</h2>
+              <div className="space-y-6">
+                <div className="relative h-6 w-full bg-slate-100 rounded-full overflow-hidden p-1 shadow-inner">
+                  <div className="h-full bg-indigo-600 rounded-full transition-all duration-700 shadow-[0_0_15px_rgba(99,102,241,0.5)]" style={{ width: `${progress}%` }} />
+                </div>
+                <div className="flex justify-between text-[10px] font-black uppercase tracking-widest text-slate-400">
+                  <span>🛰️ Active Telemetry</span>
+                  <span className="text-indigo-600">{Math.floor(progress)}% Complete</span>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {appState === APP_STATES.RATING && (
+            <div className="h-full flex flex-col justify-center text-center space-y-12">
+               <div><h2 className="text-4xl font-black italic uppercase text-slate-900">Experience?</h2><p className="text-slate-400 font-bold text-sm uppercase mt-2">Rate {matchedDriver?.name}</p></div>
+               <div className="flex justify-center gap-3">
+                  {[1,2,3,4,5].map(s => <button key={s} onClick={() => setTempRating(s)} className={`p-4 rounded-3xl transition-all ${tempRating >= s ? 'bg-indigo-600 text-white scale-110' : 'bg-slate-100 text-slate-300'}`}><Star className="w-8 h-8" /></button>)}
+               </div>
+               <button onClick={finalizeTrip} disabled={!tempRating} className="w-full bg-slate-900 text-white py-6 rounded-[35px] font-black text-xl disabled:opacity-20">Finish Review</button>
+            </div>
+          )}
+
+          {appState === APP_STATES.COMPLETED && (
+            <div className="text-center py-12 space-y-10">
+              <div className="w-36 h-36 bg-indigo-600 text-white rounded-[50px] flex items-center justify-center mx-auto shadow-2xl rotate-6 border-[10px] border-white"><CheckCircle2 className="w-20 h-20" /></div>
+              <h2 className="text-5xl font-black italic uppercase leading-none">Trip<br/>Completed</h2>
+              <button onClick={resetApp} className="w-full bg-slate-900 text-white py-7 rounded-[40px] font-black text-2xl active:scale-95">Main Base</button>
+            </div>
+          )}
+
+          {/* HISTORY / PROFILE */}
+          {appState === APP_STATES.HISTORY && (
+            <div className="h-full space-y-8 animate-in slide-in-from-right">
+               <h2 className="text-4xl font-black italic uppercase text-slate-900">History</h2>
+               <div className="space-y-4 overflow-y-auto max-h-[75vh] pb-24 no-scrollbar">
+                {tripHistory.map(t => (
+                  <div key={t.id} className="bg-white p-6 rounded-[35px] border border-slate-100 shadow-sm flex justify-between">
+                    <div><p className="text-[10px] font-black text-indigo-600 uppercase tracking-widest">{new Date(t.timestamp).toLocaleDateString()}</p><h3 className="font-black text-lg text-slate-900 truncate max-w-[150px]">{t.destination}</h3></div>
+                    <div className="text-right">
+                      <p className="font-black text-xl italic text-slate-900">${t.fare}</p>
+                      {t.rating && <div className="flex items-center gap-1 text-amber-500 font-black text-[10px] mt-1"><Star className="w-3 h-3 fill-amber-500" /> {t.rating}</div>}
+                    </div>
+                  </div>
+                ))}
+               </div>
+            </div>
+          )}
+
+          {appState === APP_STATES.PROFILE && (
+            <div className="h-full space-y-10 animate-in slide-in-from-bottom-20">
+               <header className="flex flex-col items-center gap-6 mt-10">
+                 <div className="relative"><img src={profile?.avatar} className="w-32 h-32 rounded-[45px] shadow-2xl ring-8 ring-white" alt="Avatar" /><div className="absolute -bottom-2 -right-2 bg-indigo-600 p-3 rounded-2xl text-white"><Camera className="w-5 h-5" /></div></div>
+                 <div className="text-center"><h2 className="text-3xl font-black italic text-slate-900">{profile?.name}</h2><div className="flex items-center justify-center gap-2 mt-2 font-black text-indigo-600"><Star className="w-4 h-4 fill-indigo-600" /> {profile?.rating || '5.0'}</div></div>
+               </header>
+               <div className="grid grid-cols-2 gap-4">
+                 <div className="bg-indigo-600 p-8 rounded-[40px] text-white shadow-xl">
+                   <p className="text-[10px] font-black opacity-60 uppercase mb-3">Balance</p>
+                   <p className="text-3xl font-black italic">${profile?.balance?.toFixed(2)}</p>
+                 </div>
+                 <div className="bg-slate-900 p-8 rounded-[40px] text-white shadow-xl">
+                   <p className="text-[10px] font-black opacity-60 uppercase mb-3">Earnings</p>
+                   <p className="text-3xl font-black italic">${(profile?.earnings || 0).toFixed(2)}</p>
+                 </div>
+               </div>
+               <button onClick={() => setAppState(APP_STATES.AUTH)} className="w-full py-6 text-red-500 font-black uppercase text-[10px] tracking-widest"><LogOut className="inline w-4 h-4 mr-2" /> Reset Session</button>
+            </div>
+          )}
+
+        </div>
+      </div>
+
+      {/* Chat Overlay */}
+      {isChatOpen && (
+        <div className="fixed inset-0 z-[110] flex flex-col justify-end pointer-events-none">
+          <div className="absolute inset-0 bg-slate-950/40 backdrop-blur-sm pointer-events-auto" onClick={() => setIsChatOpen(false)} />
+          <div className="relative w-full h-[85%] bg-white rounded-t-[50px] shadow-2xl pointer-events-auto flex flex-col animate-in slide-in-from-bottom-full duration-500">
+            <header className="p-8 flex items-center justify-between border-b">
+               <div className="flex items-center gap-4">
+                 <img src={role === 'rider' ? matchedDriver?.image : matchedRider?.riderImage} className="w-12 h-12 rounded-2xl bg-slate-100" alt="C" />
+                 <div><h3 className="font-black text-lg italic text-slate-900">{role === 'rider' ? matchedDriver?.name : matchedRider?.riderName}</h3><p className="text-[10px] font-black text-emerald-500 uppercase tracking-widest">Active Signal</p></div>
+               </div>
+               <button onClick={() => setIsChatOpen(false)} className="p-4 bg-slate-100 rounded-2xl"><X className="w-6 h-6" /></button>
+            </header>
+            <div className="flex-1 overflow-y-auto p-8 space-y-4 no-scrollbar">
+               {messages.map(m => (
+                 <div key={m.id} className={`flex ${m.senderId === 'system' ? 'justify-center' : m.senderId === user.uid ? 'justify-end' : 'justify-start'}`}>
+                   {m.senderId === 'system' ? (
+                     <div className="bg-slate-50 text-[10px] font-black text-slate-300 py-2 px-6 rounded-full uppercase">{m.text}</div>
+                   ) : (
+                     <div className={`max-w-[80%] p-4 rounded-[24px] font-bold text-sm shadow-sm ${m.senderId === user.uid ? 'bg-indigo-600 text-white rounded-tr-none' : 'bg-slate-100 text-slate-900 rounded-tl-none'}`}>{m.text}</div>
+                   )}
+                 </div>
+               ))}
+               <div ref={chatEndRef} />
+            </div>
+            <div className="p-8 bg-slate-50/50 border-t">
+               <div className="flex items-center gap-3 bg-white p-2 pl-6 rounded-full border">
+                 <input type="text" placeholder="Send signal..." className="flex-1 bg-transparent outline-none font-bold text-sm" value={chatInput} onChange={(e) => setChatInput(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && sendMessage()} />
+                 <button onClick={sendMessage} className="p-4 bg-indigo-600 rounded-full text-white shadow-xl active:scale-90 transition-transform"><Send className="w-5 h-5" /></button>
+               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Menu Drawer */}
+      {isMenuOpen && (
+        <div className="fixed inset-0 z-[100] bg-slate-950/70 backdrop-blur-2xl flex items-start justify-start">
+          <div className="w-[85%] h-full bg-white p-14 flex flex-col animate-in slide-in-from-left duration-500 shadow-2xl">
+            <button onClick={() => setIsMenuOpen(false)} className="self-end p-5 bg-slate-100 rounded-3xl mb-14"><X className="w-8 h-8" /></button>
+            <div className="flex items-center gap-5 mb-16 p-4 bg-slate-50 rounded-[35px]" onClick={() => {setAppState(APP_STATES.PROFILE); setIsMenuOpen(false);}}>
+               <img src={profile?.avatar} className="w-16 h-16 rounded-2xl shadow-xl" alt="M" />
+               <div className="flex-1"><p className="font-black text-xl italic leading-none">{profile?.name}</p><div className="flex items-center gap-1 text-[10px] font-black text-indigo-600 mt-2 uppercase tracking-widest"><Star className="w-3 h-3 fill-indigo-600" /> {profile?.rating || '5.0'} Status</div></div>
+            </div>
+            <nav className="flex-1 space-y-10">
+              <button onClick={() => { setRole(role === 'rider' ? 'driver' : 'rider'); setAppState(APP_STATES.HOME); setIsMenuOpen(false); }} className="block text-3xl font-black text-indigo-600 italic tracking-tighter w-full text-left underline underline-offset-8">
+                Switch to {role === 'rider' ? 'Pilot Mode' : 'Rider Mode'}
+              </button>
+              <button onClick={() => { setAppState(APP_STATES.HISTORY); setIsMenuOpen(false); }} className="block text-3xl font-black text-slate-900 tracking-tighter">Ride History</button>
+              <button onClick={() => { setAppState(APP_STATES.PROFILE); setIsMenuOpen(false); }} className="block text-3xl font-black text-slate-900 tracking-tighter">My Identity</button>
+            </nav>
+          </div>
+          <div className="flex-1 h-full" onClick={() => setIsMenuOpen(false)} />
+        </div>
+      )}
+
+      <style>{`
+        .custom-div-icon { background: none; border: none; }
+        .leaflet-container { background: #020617 !important; height: 100%; width: 100%; }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+      `}</style>
+    </div>
+  );
+}
+
